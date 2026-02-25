@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+import re
+import getpass
+import subprocess
+from collections import OrderedDict
+
+USER = getpass.getuser()
+
+REQ_KEYS = ["ncpus", "mem", "walltime", "jobfs", "mpiprocs"]
+USED_KEYS = ["walltime"]  # this becomes TimeUse
+
+def run(cmd):
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True
+    )
+    return p.returncode, p.stdout
+
+def bytes_to_gb(val):
+    """
+    Convert PBS memory strings like:
+      68719476736b
+      67108872kb
+    into human GB (rounded to 1 decimal if needed)
+    """
+    if not val:
+        return ""
+
+    val = val.lower()
+
+    try:
+        if val.endswith("kb"):
+            gb = float(val[:-2]) / (1024 * 1024)
+        elif val.endswith("mb"):
+            gb = float(val[:-2]) / 1024
+        elif val.endswith("gb"):
+            return val
+        elif val.endswith("b"):
+            gb = float(val[:-1]) / (1024 ** 3)
+        else:
+            return val
+
+        if gb.is_integer():
+            return "{}gb".format(int(gb))
+        else:
+            return "{:.1f}gb".format(gb)
+    except:
+        return val
+
+def parse_qstat_f(text):
+    jobs = []
+    cur = None
+    last_key = None
+
+    for line in text.splitlines():
+        if line.startswith("Job Id: "):
+            if cur:
+                jobs.append(cur)
+            cur = OrderedDict()
+            cur["Job_Id"] = line.split("Job Id: ", 1)[1].strip()
+            last_key = None
+            continue
+
+        if cur is None:
+            continue
+
+        if re.match(r"^\s+", line) and "=" not in line and last_key:
+            cur[last_key] = cur.get(last_key, "") + line.strip()
+            continue
+
+        m = re.match(r"^\s*([A-Za-z0-9_.]+)\s*=\s*(.*)$", line)
+        if m:
+            cur[m.group(1)] = m.group(2).strip()
+            last_key = m.group(1)
+
+    if cur:
+        jobs.append(cur)
+
+    return jobs
+
+def main():
+    rc, brief = run(["qstat", "-u", USER])
+    if rc != 0:
+        print(brief.rstrip())
+        return
+
+    jobids = []
+    for line in brief.splitlines():
+        if re.match(r"^\d+\.\S+", line.strip()):
+            jobids.append(line.split()[0])
+
+    if not jobids:
+        print("No jobs found for {}".format(USER))
+        return
+
+    rc, full = run(["qstat", "-f"] + jobids)
+    if rc != 0:
+        print(full.rstrip())
+        return
+
+    jobs = parse_qstat_f(full)
+
+    headers = ["JobID", "S", "Queue", "TimeUse"] + REQ_KEYS + ["Name"]
+    rows = []
+
+    for j in jobs:
+        row = [
+            j.get("Job_Id", ""),
+            j.get("job_state", ""),
+            j.get("queue", ""),
+            j.get("resources_used.walltime", "")
+        ]
+
+        for k in REQ_KEYS:
+            val = j.get("Resource_List.{}".format(k), "")
+            if k in ["mem", "jobfs"]:
+                val = bytes_to_gb(val)
+            row.append(val)
+
+        row.append(j.get("Job_Name", ""))
+        rows.append(row)
+
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, v in enumerate(r):
+            widths[i] = max(widths[i], len(v) if v else 1)
+
+    def fmt(r):
+        return "  ".join((r[i] if r[i] else "-").ljust(widths[i]) for i in range(len(headers)))
+
+    print(fmt(headers))
+    print("  ".join("-" * w for w in widths))
+    for r in rows:
+        print(fmt(r))
+
+if __name__ == "__main__":
+    main()
